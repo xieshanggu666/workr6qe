@@ -79,10 +79,18 @@ function finishedBatchesAt(j, atAbs) {
   return Math.min(j.qty, Math.max(0, Math.floor((eff - j.start) / j.days)))
 }
 
+// 截至 absAbs 时，某工单已开工的批次数（正在加工中的批次也算开工，原料不可退）
+function startedBatchesAt(j, atAbs) {
+  const stop = j.cancel_abs == null ? Infinity : j.cancel_abs
+  const eff = Math.min(atAbs, stop)
+  return Math.min(j.qty, Math.max(0, Math.floor((eff - j.start) / j.days) + 1))
+}
+
 // 队列重放：加工坊只有一台机器，按工单创建顺序串行加工，算出每个工单
 //   start  —— 首批开工绝对日（当天 00:00 即可开工）
 //   finish —— 全部批次完工的绝对日（用于预估还剩几天）
-// 取消的工单在 cancel_abs 立刻让出机器，后续工单自动提前。
+// 取消的工单在 cancel_abs 立刻让出机器，后续工单自动提前；
+// 尚未开工就被取消的工单从未占用机器，游标不得回退（否则后续工单会排到过去、提前产出）。
 function replay(jobs) {
   let cursor = 0
   for (const j of jobs) {
@@ -95,8 +103,17 @@ function replay(jobs) {
       if (bEnd > stop) break
       finish = bEnd
     }
-    j.finish = Math.min(finish, stop)
-    cursor = j.finish
+    if (j.cancel_abs == null) {
+      j.finish = finish
+      cursor = finish
+    } else if (start < stop) {
+      // 取消时已有批次开工（可能正加工到一半）：机器一直占用到取消时刻才让出
+      j.finish = stop
+      cursor = stop
+    } else {
+      // 取消时还没轮到开工：这张工单没碰过机器，游标保持不动
+      j.finish = start
+    }
   }
   return jobs
 }
@@ -114,6 +131,11 @@ export function listJobs(currentAbs) {
     j.doneBatches = finishedBatchesAt(j, currentAbs)
     // 已全部退料的取消工单没有可领成品，直接出队
     if (j.status === 'canceled' && j.doneBatches === 0) continue
+    j.startedBatches = j.status === 'canceled'
+      ? startedBatchesAt(j, j.cancel_abs)
+      : startedBatchesAt(j, currentAbs)
+    // 取消时实际退料的批次数 = 取消时点尚未开工的批次
+    j.refundedBatches = j.status === 'canceled' ? Math.max(0, j.qty - j.startedBatches) : 0
     j.waitingBatches = j.status === 'running' ? j.qty - j.doneBatches : 0
     j.computedStatus = j.status === 'running'
       ? (j.doneBatches >= j.qty ? 'done' : 'running')
@@ -183,7 +205,8 @@ export function enqueueJob({ recipeId, qty, millLevel, currentAbs }) {
   }
 }
 
-// 取消工单：退还尚未开工批次的原料；已完工批次保留成品待入库
+// 取消工单：退还尚未开工批次的原料；已开工（含加工中）批次不退料，
+// 已完工批次保留成品待入库，加工中批次随取消作废。
 export function cancelJob({ id, currentAbs }) {
   const j = q1('SELECT * FROM production_jobs WHERE id=?', id)
   if (!j) throw Object.assign(new Error('工单不存在'), { status: 404 })
@@ -191,7 +214,9 @@ export function cancelJob({ id, currentAbs }) {
 
   const cur = allJobs().find((x) => x.id === id)
   const finishedBatches = finishedBatchesAt(cur, currentAbs)
-  const refundBatches = j.qty - finishedBatches
+  // 正在加工的批次已投入原料、尚未产出，取消即作废；只退还没开工的批次
+  const startedBatches = startedBatchesAt(cur, currentAbs)
+  const refundBatches = Math.max(0, j.qty - startedBatches)
 
   db.exec('BEGIN IMMEDIATE')
   try {

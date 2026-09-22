@@ -94,7 +94,7 @@
           </b>
           <span class="tag">批次 {{ j.doneBatches }}/{{ j.qty }}</span>
           <span class="tag" v-if="j.computedStatus==='running'">⏳ 约剩 {{ j.remainDays }} 天</span>
-          <span class="tag" v-if="j.status==='canceled' && j.qty-j.doneBatches>0">已退 {{ j.qty-j.doneBatches }} 批原料</span>
+          <span class="tag" v-if="j.status==='canceled' && j.refundedBatches>0">已退 {{ j.refundedBatches }} 批原料</span>
           <div class="job-bar"><i :style="{width:(j.doneBatches/j.qty*100)+'%'}"></i></div>
         </div>
         <button v-if="j.status==='running'" class="mini" @click="store.cancelProduction(j.id)">取消退料</button>
