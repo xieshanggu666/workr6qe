@@ -82,21 +82,30 @@ function finishedBatchesAt(j, atAbs) {
 // 队列重放：加工坊只有一台机器，按工单创建顺序串行加工，算出每个工单
 //   start  —— 首批开工绝对日（当天 00:00 即可开工）
 //   finish —— 全部批次完工的绝对日（用于预估还剩几天）
-// 取消的工单在 cancel_abs 立刻让出机器，后续工单自动提前。
+// 取消的工单在 cancel_abs 立刻让出机器，后续工单自动提前；
+// 但开工前就取消的工单从未占用机器，游标必须原地不动——绝不能回退，
+// 否则排在前面/中间的工单取消后，后续工单会被排到过去，与在制批次并行
+// （表现为提前产出、排队工单"幽灵完工"并少退原料）。
 function replay(jobs) {
   let cursor = 0
   for (const j of jobs) {
     const start = Math.max(cursor, j.enqueue_abs)
     j.start = start
-    const stop = j.cancel_abs == null ? Infinity : j.cancel_abs
-    let finish = start
-    for (let b = 0; b < j.qty; b++) {
-      const bEnd = start + (b + 1) * j.days
-      if (bEnd > stop) break
-      finish = bEnd
+    const fullEnd = start + j.qty * j.days
+    if (j.cancel_abs == null) {
+      // 未取消：整单跑完，机器一直占用到末批完工
+      j.finish = fullEnd
+      cursor = j.finish
+    } else if (j.cancel_abs <= start) {
+      // 开工前（含开工当天尚未有批次完工时）取消：从未占用机器，
+      // finish 仅作占位，游标保持不变，后续工单排期不受影响
+      j.finish = start
+    } else {
+      // 加工中取消：机器占用到取消时刻（未完工的在制批次此时中断退料），
+      // 后续工单从 cancel_abs 开始接上；不会早于整单完工点
+      j.finish = Math.min(j.cancel_abs, fullEnd)
+      cursor = j.finish
     }
-    j.finish = Math.min(finish, stop)
-    cursor = j.finish
   }
   return jobs
 }
@@ -190,7 +199,8 @@ export function cancelJob({ id, currentAbs }) {
   if (j.status !== 'running') throw Object.assign(new Error('该工单已结束，无法取消'), { status: 400 })
 
   const cur = allJobs().find((x) => x.id === id)
-  const finishedBatches = finishedBatchesAt(cur, currentAbs)
+  // finished 只增不减（幂等原则）：重放结果不得小于已落库的完工数
+  const finishedBatches = Math.max(j.finished, finishedBatchesAt(cur, currentAbs))
   const refundBatches = j.qty - finishedBatches
 
   db.exec('BEGIN IMMEDIATE')
